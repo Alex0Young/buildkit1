@@ -161,7 +161,6 @@ func Build(ctx context.Context, c client.Client) (_ *client.Result, err error) {
 
 		process.Wait()
 		// fmt.Println("Build ok ---->")
-		;;;
 
 		ref, err := r.SingleRef()
 		if err != nil {

